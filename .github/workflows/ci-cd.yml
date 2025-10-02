@@ -10,17 +10,14 @@ on:
     # Nightly rebuild at 2 AM UTC to pull in latest security updates
     - cron: '0 2 * * *'
   workflow_dispatch:
-
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-
 permissions:
   contents: read
   packages: write
   security-events: write
   pull-requests: read
-
 jobs:
   # Code quality: shfmt formatting and ShellCheck linting for any shell scripts and Dockerfile scripts
   lint:
@@ -49,7 +46,6 @@ jobs:
           echo "$FILES" | tr ' ' '\n' | xargs -r shellcheck -x
         env:
           FILES: ${{ steps.files.outputs.files }}
-
   # SAST Scan with Hadolint for Dockerfile
   dockerfile-lint:
     name: Dockerfile SAST Scan
@@ -73,7 +69,6 @@ jobs:
         with:
           sarif_file: hadolint-results.sarif
           category: hadolint
-
   # Build and Scan Docker Image
   build-and-scan:
     name: Build, SAST, and DAST Scans
@@ -122,7 +117,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
+      - name: Tag image for scanning
+        run: |
+          docker tag $(echo "${{ steps.meta.outputs.tags }}" | head -n1) "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
       - name: Run Trivy filesystem SAST scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -137,7 +134,6 @@ jobs:
         with:
           sarif_file: 'trivy-fs-results.sarif'
           category: 'trivy-fs'
-
       - name: Run Trivy image DAST scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -152,7 +148,6 @@ jobs:
         with:
           sarif_file: 'trivy-image-results.sarif'
           category: 'trivy-image'
-
       - name: Run Dockle container linter
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
@@ -168,34 +163,26 @@ jobs:
         with:
           name: dockle-results
           path: dockle-results.json
-
       - name: Test image functionality (runtime checks)
         run: |
           set -euo pipefail
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           # Build a local tag if needed
           docker tag $(echo "${{ steps.meta.outputs.tags }}" | head -n1) "$IMAGE" || true
-
           # 1) Ensure runs as non-root
           uid=$(docker run --rm "$IMAGE" id -u)
           if [ "$uid" = "0" ]; then echo "Image runs as root!"; exit 1; fi
-
           # 2) Ensure tini is PID 1
           pid1=$(docker run --rm "$IMAGE" ps -o pid,comm --no-headers | awk 'NR==1{print $2}')
           if [ "$pid1" != "tini" ]; then echo "tini is not PID1 ($pid1)!"; exit 1; fi
-
           # 3) Validate locale
           out=$(docker run --rm "$IMAGE" /bin/bash -lc 'echo $LANG $LC_ALL && locale -a | grep -i en_US.utf8')
           echo "$out"
-
           # 4) Validate install_packages works and cleans cache
           docker run --rm --user 0 "$IMAGE" /bin/bash -lc 'install_packages jq && command -v jq && [ ! -d /var/lib/apt/lists ]'
-
           # 5) Basic networking and certs
           docker run --rm "$IMAGE" curl -fsSL https://example.com >/dev/null
-
           echo "Runtime checks passed"
-
       - name: Push Docker image to GHCR
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v5
@@ -206,7 +193,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
       - name: Generate SBOM
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: anchore/sbom-action@v0
@@ -220,7 +206,6 @@ jobs:
         with:
           name: sbom
           path: sbom.spdx.json
-
       - name: Make GHCR package public
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         run: |
@@ -234,7 +219,6 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/user/packages/container/${IMAGE_NAME_ESCAPED}/visibility \
             -d '{"visibility":"public"}'
-
   # Summary job
   summary:
     name: Pipeline Summary
