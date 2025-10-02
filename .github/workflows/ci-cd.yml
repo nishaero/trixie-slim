@@ -49,7 +49,6 @@ jobs:
           echo "$FILES" | tr ' ' '\n' | xargs -r shellcheck -x
         env:
           FILES: ${{ steps.files.outputs.files }}
-
   # SAST Scan with Hadolint for Dockerfile
   dockerfile-lint:
     name: Dockerfile SAST Scan
@@ -73,7 +72,6 @@ jobs:
         with:
           sarif_file: hadolint-results.sarif
           category: hadolint
-
   # Build and Scan Docker Image
   build-and-scan:
     name: Build, SAST, and DAST Scans
@@ -90,13 +88,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       # Set up QEMU for multi-arch builds (required for ARM emulation on x86 runners)
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -104,7 +100,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       # Login to Docker Hub (optional, only if credentials are configured)
       - name: Log in to Docker Hub
         if: github.event_name != 'pull_request'
@@ -113,25 +108,19 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
         continue-on-error: true
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # GHCR always included, Docker Hub added if credentials exist
+          # Only generate semver tags and latest for default branch; remove branch/sha tags from Docker Hub release flow
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             ${{ env.DOCKERHUB_IMAGE }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
-
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       # Build for local testing only (single platform for speed)
       - name: Build Docker image for testing
         id: build
@@ -144,11 +133,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
       - name: Tag image for scanning
         run: |
           docker tag $(echo "${{ steps.meta.outputs.tags }}" | head -n1) "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-
       - name: Run Trivy filesystem SAST scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -163,7 +150,6 @@ jobs:
         with:
           sarif_file: 'trivy-fs-results.sarif'
           category: 'trivy-fs'
-
       - name: Run Trivy image DAST scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -178,7 +164,6 @@ jobs:
         with:
           sarif_file: 'trivy-image-results.sarif'
           category: 'trivy-image'
-
       - name: Run Dockle container linter
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
@@ -194,7 +179,6 @@ jobs:
         with:
           name: dockle-results
           path: dockle-results.json
-
       - name: Test image functionality (runtime checks)
         run: |
           set -euo pipefail
@@ -215,28 +199,56 @@ jobs:
           # 5) Basic networking and certs
           docker run --rm "$IMAGE" curl -fsSL https://example.com >/dev/null
           echo "Runtime checks passed"
-
-      # Multi-arch build and push to GHCR (and Docker Hub if credentials configured)
-      # NOTE: Extensible - add more architectures as needed (e.g., linux/ppc64le, linux/s390x)
-      - name: Build and push multi-arch Docker images
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      # Multi-arch build and push to Docker Hub only for semver tags
+      - name: Build and push multi-arch Docker images (Docker Hub, semver-only)
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/build-push-action@v5
         with:
           context: .
-          # Multi-architecture support: amd64 (x86_64), arm64 (ARMv8), armv7 (32-bit ARM)
-          # Extensible: Add more platforms as Debian/Docker support evolves
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: |
+            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
+            ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name || 'v0.0.0' }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
+      - name: Derive semver tag parts
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+        id: semver
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          MAJOR=$(echo "$VER" | cut -d. -f1)
+          MINOR=$(echo "$VER" | cut -d. -f2)
+          echo "major=v$MAJOR" >> $GITHUB_OUTPUT
+          echo "minor=v$MAJOR.$MINOR" >> $GITHUB_OUTPUT
+      - name: Add major/minor tags on Docker Hub
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.DOCKERHUB_IMAGE }}:${{ steps.semver.outputs.minor }} \
+            -t ${{ env.DOCKERHUB_IMAGE }}:${{ steps.semver.outputs.major }} \
+            ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
+      - name: Remove non-semver tags from Docker Hub
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKER_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Cleaning up non-semver tags on Docker Hub"
+          echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          # Delete 'main', 'main-*', and commit SHA tags if they exist
+          for TAG in main $(docker manifest inspect ${{ env.DOCKERHUB_IMAGE }}:latest -v 2>/dev/null | jq -r '.[].Digest' | head -n1 | xargs -I{} echo "${GITHUB_SHA}"); do
+            docker manifest rm ${{ env.DOCKERHUB_IMAGE }}:$TAG || true
+          done
       - name: Install cosign
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
         uses: sigstore/cosign-installer@v3.5.0
-      - name: Sign multi-arch images with cosign (keyless or key-based)
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      - name: Sign Docker Hub images with cosign (keyless or key-based)
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
         env:
           COSIGN_EXPERIMENTAL: 'true'
           COSIGN_YES: 'true'
@@ -244,35 +256,28 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          # Iterate over all tags produced by metadata-action
-          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | while read -r TAG; do
-            [ -z "$TAG" ] && continue
-            if echo "$TAG" | grep -q '^ghcr.io\|^nishaero/'; then
-              echo "Signing $TAG"
-              if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
-                echo "$COSIGN_PRIVATE_KEY" | base64 -d > cosign.key
-                cosign sign --key cosign.key "$TAG"
-                rm -f cosign.key
-              else
-                cosign sign "$TAG"
-              fi
+          for TAG in latest ${{ github.ref_name }} ${{ steps.semver.outputs.minor }} ${{ steps.semver.outputs.major }}; do
+            if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
+              echo "$COSIGN_PRIVATE_KEY" | base64 -d > cosign.key
+              cosign sign --key cosign.key "docker.io/${{ env.DOCKERHUB_IMAGE }}:$TAG"
+              rm -f cosign.key
+            else
+              cosign sign "docker.io/${{ env.DOCKERHUB_IMAGE }}:$TAG"
             fi
           done
-
-      - name: Generate SBOM
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      - name: Generate SBOM (Docker Hub image)
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          image: docker.io/${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
           format: spdx-json
           output-file: sbom.spdx.json
       - name: Upload SBOM
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: sbom
           path: sbom.spdx.json
-
   # Summary job
   summary:
     name: Pipeline Summary
@@ -291,15 +296,11 @@ jobs:
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "🌙 **Nightly rebuild completed** - Image updated with latest security patches" >> $GITHUB_STEP_SUMMARY
           elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "✅ **Multi-arch images published, signed, and pushed**" >> $GITHUB_STEP_SUMMARY
-            echo "- GHCR: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
-            echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
-            echo "- Architectures: linux/amd64, linux/arm64, linux/arm/v7" >> $GITHUB_STEP_SUMMARY
+            echo "🔍 **PR/branch validation completed** - No images pushed to Docker Hub" >> $GITHUB_STEP_SUMMARY
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "🏷️ **Semantic versioned release published and signed**" >> $GITHUB_STEP_SUMMARY
-            echo "- Version: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
-            echo "- GHCR: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
-            echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
+            echo "🏷️ **Semantic versioned release published to Docker Hub**" >> $GITHUB_STEP_SUMMARY
+            echo "- Docker Hub: ${{ env.DOCKERHUB_IMAGE }} (latest, ${{ github.ref_name }}, ${{ steps.semver.outputs.minor }}, ${{ steps.semver.outputs.major }})" >> $GITHUB_STEP_SUMMARY
+            echo "- Architectures: linux/amd64, linux/arm64, linux/arm/v7" >> $GITHUB_STEP_SUMMARY
           else
             echo "🔍 **PR validation completed** - Ready for review" >> $GITHUB_STEP_SUMMARY
           fi
