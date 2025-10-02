@@ -1,5 +1,4 @@
 name: CI/CD Pipeline
-
 on:
   push:
     branches:
@@ -23,6 +22,34 @@ permissions:
   pull-requests: read
 
 jobs:
+  # Code quality: shfmt formatting and ShellCheck linting for any shell scripts and Dockerfile scripts
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install shfmt and shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shfmt shellcheck
+      - name: Find shell scripts
+        id: files
+        run: |
+          echo "files=$(git ls-files | grep -E '\\.(sh|bash)$|/usr/local/bin/install_packages$' || true)" >> $GITHUB_OUTPUT
+      - name: Run shfmt (check only)
+        if: steps.files.outputs.files != ''
+        run: |
+          echo "$FILES" | tr ' ' '\n' | xargs -r shfmt -i 2 -d
+        env:
+          FILES: ${{ steps.files.outputs.files }}
+      - name: Run ShellCheck
+        if: steps.files.outputs.files != ''
+        run: |
+          echo "$FILES" | tr ' ' '\n' | xargs -r shellcheck -x
+        env:
+          FILES: ${{ steps.files.outputs.files }}
+
   # SAST Scan with Hadolint for Dockerfile
   dockerfile-lint:
     name: Dockerfile SAST Scan
@@ -33,7 +60,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Run Hadolint
         uses: hadolint/hadolint-action@v3.1.0
         with:
@@ -41,7 +67,6 @@ jobs:
           format: sarif
           output-file: hadolint-results.sarif
           no-fail: true
-
       - name: Upload Hadolint SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
@@ -53,19 +78,19 @@ jobs:
   build-and-scan:
     name: Build, SAST, and DAST Scans
     runs-on: ubuntu-latest
+    needs: [lint, dockerfile-lint]
     permissions:
       contents: read
       packages: write
       security-events: write
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
+      image-ref: ${{ steps.meta.outputs.tags }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -73,7 +98,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -87,7 +111,6 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
             type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
-
       - name: Build Docker image
         id: build
         uses: docker/build-push-action@v5
@@ -108,7 +131,6 @@ jobs:
           format: 'sarif'
           output: 'trivy-fs-results.sarif'
           severity: 'CRITICAL,HIGH,MEDIUM'
-
       - name: Upload Trivy SAST results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
@@ -124,7 +146,6 @@ jobs:
           format: 'sarif'
           output: 'trivy-image-results.sarif'
           severity: 'CRITICAL,HIGH,MEDIUM'
-
       - name: Upload Trivy DAST results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
@@ -141,7 +162,6 @@ jobs:
             --output dockle-results.json \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         continue-on-error: true
-
       - name: Upload Dockle results
         uses: actions/upload-artifact@v4
         if: always()
@@ -149,9 +169,32 @@ jobs:
           name: dockle-results
           path: dockle-results.json
 
-      - name: Test image functionality
+      - name: Test image functionality (runtime checks)
         run: |
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} /bin/bash -c 'echo "Image test successful"'
+          set -euo pipefail
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # Build a local tag if needed
+          docker tag $(echo "${{ steps.meta.outputs.tags }}" | head -n1) "$IMAGE" || true
+
+          # 1) Ensure runs as non-root
+          uid=$(docker run --rm "$IMAGE" id -u)
+          if [ "$uid" = "0" ]; then echo "Image runs as root!"; exit 1; fi
+
+          # 2) Ensure tini is PID 1
+          pid1=$(docker run --rm "$IMAGE" ps -o pid,comm --no-headers | awk 'NR==1{print $2}')
+          if [ "$pid1" != "tini" ]; then echo "tini is not PID1 ($pid1)!"; exit 1; fi
+
+          # 3) Validate locale
+          out=$(docker run --rm "$IMAGE" /bin/bash -lc 'echo $LANG $LC_ALL && locale -a | grep -i en_US.utf8')
+          echo "$out"
+
+          # 4) Validate install_packages works and cleans cache
+          docker run --rm --user 0 "$IMAGE" /bin/bash -lc 'install_packages jq && command -v jq && [ ! -d /var/lib/apt/lists ]'
+
+          # 5) Basic networking and certs
+          docker run --rm "$IMAGE" curl -fsSL https://example.com >/dev/null
+
+          echo "Runtime checks passed"
 
       - name: Push Docker image to GHCR
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -171,7 +214,6 @@ jobs:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: spdx-json
           output-file: sbom.spdx.json
-
       - name: Upload SBOM
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
@@ -179,17 +221,32 @@ jobs:
           name: sbom
           path: sbom.spdx.json
 
+      - name: Make GHCR package public
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          # Requires GITHUB_TOKEN with packages:write and repo scope (default in actions)
+          OWNER=${{ github.repository_owner }}
+          REPO=${{ github.repository }}
+          IMAGE_NAME_ESCAPED=$(echo "${REPO}" | sed 's#/#%2F#g')
+          # Make public via GitHub API
+          curl -sSL -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user/packages/container/${IMAGE_NAME_ESCAPED}/visibility \
+            -d '{"visibility":"public"}'
+
   # Summary job
   summary:
     name: Pipeline Summary
     runs-on: ubuntu-latest
-    needs: [dockerfile-lint, build-and-scan]
+    needs: [lint, dockerfile-lint, build-and-scan]
     if: always()
     steps:
       - name: Check job statuses
         run: |
           echo "## CI/CD Pipeline Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Lint & Format: ${{ needs.lint.result }}" >> $GITHUB_STEP_SUMMARY
           echo "- Dockerfile Lint: ${{ needs.dockerfile-lint.result }}" >> $GITHUB_STEP_SUMMARY
           echo "- Build and Scan: ${{ needs.build-and-scan.result }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
