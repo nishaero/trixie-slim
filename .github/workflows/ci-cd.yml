@@ -159,7 +159,7 @@ jobs:
       - name: Ensure Trivy image SARIF exists (fallback)
         if: always()
         run: |
-          [ -f trivy-image-results.sarif ] || echo '{"version":"2.1.0","runs":[]}' > trivy-image-results.sarif
+          [ -f trivy-image-results.sarif ] || echo '{}' > trivy-image-results.sarif
       - name: Upload Trivy DAST results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
@@ -352,4 +352,4 @@ jobs:
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "- Validate Published Image: ${{ needs.validate-published-image.result }}" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- Validate Published Image: skipped (PR/non-tag build)" >> $GITHUB
+            echo "- Validate Published Image: skipped (PR/non-tag build)" >> $GITHUB_STEP_SUMMARY
