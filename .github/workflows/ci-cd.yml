@@ -5,24 +5,25 @@ on:
       - main
     tags:
       - 'v*.*.*'
+      - 'v*.*'
+      - 'v*'
   pull_request:
     branches:
       - main
-  schedule:
-    # Nightly rebuild at 2 AM UTC to pull in latest security updates
-    - cron: '0 2 * * *'
   workflow_dispatch:
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   DOCKERHUB_IMAGE: nishaero/trixie-slim
+
 permissions:
   contents: read
   packages: write
   security-events: write
   pull-requests: read
+
 jobs:
-  # Code quality: shfmt formatting and ShellCheck linting for any shell scripts and Dockerfile scripts
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
@@ -49,7 +50,7 @@ jobs:
           echo "$FILES" | tr ' ' '\n' | xargs -r shellcheck -x
         env:
           FILES: ${{ steps.files.outputs.files }}
-  # SAST Scan with Hadolint for Dockerfile
+
   dockerfile-lint:
     name: Dockerfile SAST Scan
     runs-on: ubuntu-latest
@@ -72,7 +73,7 @@ jobs:
         with:
           sarif_file: hadolint-results.sarif
           category: hadolint
-  # Build and Scan Docker Image
+
   build-and-scan:
     name: Build, SAST, and DAST Scans
     runs-on: ubuntu-latest
@@ -81,10 +82,10 @@ jobs:
       contents: read
       packages: write
       security-events: write
-      id-token: write  # for keyless cosign
+      id-token: write
     outputs:
-      image-ref: ${{ steps.meta.outputs.tags }}
-      sha-tag: ${{ steps.sha.outputs.sha_tag }}
+      published-tags: ${{ steps.filter-tags.outputs.published_tags }}
+      built-image: ${{ steps.build.outputs.imageid }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -92,21 +93,8 @@ jobs:
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-        continue-on-error: true
-      - name: Extract metadata
+
+      - name: Extract metadata (full)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -114,19 +102,35 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             ${{ env.DOCKERHUB_IMAGE }}
           tags: |
-            # Semantic version tags when pushing a Git tag starting with v*
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            # Latest for default branch
             type=raw,value=latest,enable={{is_default_branch}}
-            # Branch name for non-tag builds
             type=ref,event=branch
-            # Short SHA tag for traceability
-            type=sha,prefix={{branch}}-,format=short
-            # Nightly schedule tag
-            type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
-      - name: Build Docker image for testing (single-arch)
+            type=sha,format=short
+
+      - name: Determine final publishable tags (latest and semver only)
+        id: filter-tags
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra TAGS <<< "${{ steps.meta.outputs.tags }}"
+          publish_tags=()
+          for t in "${TAGS[@]}"; do
+            # keep only latest, v1.2.3, 1.2, 1 AND their ghcr.io or dockerhub image refs
+            if [[ "$t" =~ :latest$ ]]; then
+              publish_tags+=("$t")
+            elif [[ "$t" =~ :(v?[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              publish_tags+=("$t")
+            elif [[ "$t" =~ :(v?[0-9]+\.[0-9]+)$ ]]; then
+              publish_tags+=("$t")
+            elif [[ "$t" =~ :(v?[0-9]+)$ ]]; then
+              publish_tags+=("$t")
+            fi
+          done
+          printf '%s' "published_tags=${publish_tags[*]}" | sed 's/ /,/g' >> $GITHUB_OUTPUT
+          echo "Filtered publishable tags:"; printf '%s\n' "${publish_tags[@]}"
+
+      - name: Build Docker image for testing (no push)
         id: build
         uses: docker/build-push-action@v5
         with:
@@ -137,12 +141,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Tag image for scanning with SHA
-        id: sha
-        run: |
-          TEST_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          docker tag $(echo "${{ steps.meta.outputs.tags }}" | head -n1) "$TEST_TAG"
-          echo "sha_tag=$TEST_TAG" >> $GITHUB_OUTPUT
+
       - name: Run Trivy filesystem SAST scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -157,11 +156,12 @@ jobs:
         with:
           sarif_file: 'trivy-fs-results.sarif'
           category: 'trivy-fs'
+
       - name: Run Trivy image DAST scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'image'
-          image-ref: ${{ steps.sha.outputs.sha_tag }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: 'sarif'
           output: 'trivy-image-results.sarif'
           severity: 'CRITICAL,HIGH,MEDIUM'
@@ -171,6 +171,7 @@ jobs:
         with:
           sarif_file: 'trivy-image-results.sarif'
           category: 'trivy-image'
+
       - name: Run Dockle container linter
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
@@ -178,7 +179,7 @@ jobs:
             --exit-code 0 \
             --format json \
             --output dockle-results.json \
-            ${{ steps.sha.outputs.sha_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
         continue-on-error: true
       - name: Upload Dockle results
         uses: actions/upload-artifact@v4
@@ -186,21 +187,40 @@ jobs:
         with:
           name: dockle-results
           path: dockle-results.json
-      - name: Build and push multi-arch Docker images
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+        continue-on-error: true
+
+      - name: Build and push multi-arch images (only latest/semver, no branch/SHA)
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.filter-tags.outputs.published_tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
       - name: Install cosign
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: sigstore/cosign-installer@v3.5.0
-      - name: Sign multi-arch images with cosign (keyless or key-based)
+
+      - name: Sign published tags only
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         env:
           COSIGN_EXPERIMENTAL: 'true'
@@ -209,7 +229,7 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | while read -r TAG; do
+          echo "${{ steps.filter-tags.outputs.published_tags }}" | tr ',' '\n' | while read -r TAG; do
             [ -z "$TAG" ] && continue
             if echo "$TAG" | grep -q '^ghcr.io\|^nishaero/'; then
               echo "Signing $TAG"
@@ -222,11 +242,12 @@ jobs:
               fi
             fi
           done
-      - name: Generate SBOM
+
+      - name: Generate SBOM for pushed image (use one published tag)
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ steps.sha.outputs.sha_tag }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
           format: spdx-json
           output-file: sbom.spdx.json
       - name: Upload SBOM
@@ -235,23 +256,12 @@ jobs:
         with:
           name: sbom
           path: sbom.spdx.json
-      - name: Make GHCR package public
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags_v'))
-        run: |
-          OWNER=${{ github.repository_owner }}
-          REPO=${{ github.repository }}
-          IMAGE_NAME_ESCAPED=$(echo "${REPO}" | sed 's#/#%2F#g')
-          curl -sSL -X PATCH \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/user/packages/container/${IMAGE_NAME_ESCAPED}/visibility \
-            -d '{"visibility":"public"}'
 
-  # NEW: Pull, verify signature, and validate the published image
   validate-published-image:
     name: Validate Published Image (Security & Features)
     runs-on: ubuntu-latest
     needs: [build-and-scan]
+    if: github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: read
@@ -261,15 +271,14 @@ jobs:
       - name: Determine pull tag
         id: pulltag
         run: |
-          if [[ "${{ github.event_name }}" != "pull_request" && ( "${{ github.ref }}" == "refs/heads/main" ) ]]; then
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "tag=latest" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event_name }}" != "pull_request" && "${{ github.ref }}" == refs/tags/v* ]]; then
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
-            echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "tag=" >> $GITHUB_OUTPUT
           fi
       - name: Log in to GHCR (read)
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -278,20 +287,17 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.5.0
       - name: Verify cosign signature (GHCR)
-        if: github.event_name != 'pull_request'
         env:
           COSIGN_EXPERIMENTAL: 'true'
         run: |
           set -euxo pipefail
           IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.pulltag.outputs.tag }}"
-          echo "Verifying signature for $IMG"
           cosign verify "$IMG" --certificate-identity-regexp ".*" --certificate-oidc-issuer-regexp ".*"
       - name: Pull image from GHCR
         run: |
           set -euxo pipefail
           IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.pulltag.outputs.tag }}"
           docker pull "$IMG"
-          echo "image=$IMG" >> $GITHUB_OUTPUT
       - name: Run Trivy image scan (published)
         uses: aquasecurity/trivy-action@master
         with:
@@ -333,22 +339,29 @@ jobs:
           docker run --rm --user 0 "$IMG" /bin/bash -lc 'install_packages jq && command -v jq && [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null)" ]'
           docker run --rm "$IMG" curl -fsSL https://example.com >/dev/null
           echo "Published image validation passed"
-  # Summary job
+
   summary:
     name: Pipeline Summary
     runs-on: ubuntu-latest
     needs: [lint, dockerfile-lint, build-and-scan, validate-published-image]
     if: always()
     steps:
-      - name: Check job statuses
+      - name: Report
         run: |
           echo "## CI/CD Pipeline Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- Lint & Format: ${{ needs.lint.result }}" >> $GITHUB_STEP_SUMMARY
           echo "- Dockerfile Lint: ${{ needs.dockerfile-lint.result }}" >> $GITHUB_STEP_SUMMARY
           echo "- Build and Scan: ${{ needs.build-and-scan.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Validate Published Image: ${{ needs.validate-published-image.result }}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "- Validate Published Image: ${{ needs.validate-published-image.result }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Validate Published Image: skipped (PR/non-tag build)" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            echo "🌙 **Nightly rebuild completed** - Image updated with latest security patches" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "Published tags: latest" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "Published tags: latest, ${{ github.ref_name }} (with semver aliases)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Published tags: none (build/test only)" >> $GITHUB_STEP_SUMMARY
