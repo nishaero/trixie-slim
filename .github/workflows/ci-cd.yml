@@ -85,6 +85,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      # Set up QEMU for multi-arch builds (required for ARM emulation on x86 runners)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to GitHub Container Registry
@@ -115,7 +118,8 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
             type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
-      - name: Build Docker image
+      # Build for local testing only (single platform for speed)
+      - name: Build Docker image for testing
         id: build
         uses: docker/build-push-action@v5
         with:
@@ -192,11 +196,16 @@ jobs:
           # 5) Basic networking and certs
           docker run --rm "$IMAGE" curl -fsSL https://example.com >/dev/null
           echo "Runtime checks passed"
-      - name: Push Docker image to GHCR and Docker Hub
+      # Multi-arch build and push to both GHCR and Docker Hub
+      # NOTE: Extensible - add more architectures as needed (e.g., linux/ppc64le, linux/s390x)
+      - name: Build and push multi-arch Docker images
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v5
         with:
           context: .
+          # Multi-architecture support: amd64 (x86_64), arm64 (ARMv8), armv7 (32-bit ARM)
+          # Extensible: Add more platforms as Debian/Docker support evolves
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -246,9 +255,10 @@ jobs:
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "🌙 **Nightly rebuild completed** - Image updated with latest security patches" >> $GITHUB_STEP_SUMMARY
           elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "✅ **Image published to GHCR and Docker Hub**" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Multi-arch images published to GHCR and Docker Hub**" >> $GITHUB_STEP_SUMMARY
             echo "- GHCR: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
             echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
+            echo "- Architectures: linux/amd64, linux/arm64, linux/arm/v7" >> $GITHUB_STEP_SUMMARY
           else
             echo "🔍 **PR validation completed** - Ready for review" >> $GITHUB_STEP_SUMMARY
           fi
