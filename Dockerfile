@@ -36,6 +36,7 @@ RUN apt-get update && \
     curl \
     tini \
     sudo \
+    procps \
     && apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
