@@ -404,7 +404,35 @@ Copy and paste this prompt into any LLM to recreate a minimal, secure, multi-arc
 
 You're an expert in secure container image pipelines. I want a reproducible, production-ready, minimal Debian Trixie base image project like Bitnami/minideb, but with improved hardening and modern supply chain security. Please do all of the following, with no further interaction:
 
-- **Create Dockerfile:** ... (rest of LLM prompt as given)
+- **Create `Dockerfile`:**
+  - Use `debian:trixie-slim`
+  - Install only essential dependencies: ca-certificates, curl, tini, sudo, procps, locales (minimal base)
+  - Create non-root user (`appuser`), home `/app`
+  - Implement a secure `install_packages` script (root-only, but `sudo install_packages` allowed for `appuser` without password; locked-down sudoers file)
+  - Remove world-writable files except `/tmp`, `/var/tmp`; strip all setuid/setgid except sudo; remove docs/man/caches/logs
+  - Add OCI/security labels (`.image.source`, `.image.licenses`, `.vendor`, `security.profile`, etc)
+  - Set entrypoint to tini; default user is appuser; minimal environment
+
+- **Create `.github/workflows/ci-cd.yml` with these jobs:**
+  1. Lint & Format
+  2. Dockerfile SAST (Hadolint)
+  3. Build & Push Multi-arch Docker Image (amd64/arm64/arm/v7) to Docker Hub (`nishaero/trixie-slim`) and GHCR, semantic version tags (main, latest, v*, v*.*, v*.*.* only)
+  4. SAST (Trivy filesystem)
+  5. DAST (Trivy image, Dockle)
+  6. Sign all published, named/tagged images (not sha) with cosign—use keyless or repo secret for signing key
+  7. Final "validate published image" job: pull from public registry, verify signature, test non-root, tini PID 1, install_packages as sudo, locale, curl, Trivy scan, Dockle
+  8. Generate & upload SPDX SBOM
+  9. Pipeline summary with artifact links, statuses, and final tag list
+
+- Use parallel jobs for SAST/DAST/signing/validation after build to minimize workflow runtimes.
+
+- All images published (and signed) must use tag or semver tag (not sha); validate at least latest and v*.*.* tags.
+
+- README section showing this prompt as a collapsible code block with summary: "Automated End-to-End CI/CD & Hardened Image Creation Prompt (for LLMs)"
+
+- Provide clear usage for both base image and `install_packages` in README, reference multi-stage recommendation for packages requiring dev tools or compilers.
+
+**No additional questions—output all files ready for use as if creating a repo for an enterprise security team.** Be concise: only produce real config/code/scripts/docs and nothing else.
 
 </details>
 
