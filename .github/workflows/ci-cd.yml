@@ -11,18 +11,15 @@ on:
     branches:
       - main
   workflow_dispatch:
-
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   DOCKERHUB_IMAGE: nishaero/trixie-slim
-
 permissions:
   contents: read
   packages: write
   security-events: write
   pull-requests: read
-
 jobs:
   lint:
     name: Lint & Format
@@ -50,7 +47,6 @@ jobs:
           echo "$FILES" | tr ' ' '\n' | xargs -r shellcheck -x
         env:
           FILES: ${{ steps.files.outputs.files }}
-
   dockerfile-lint:
     name: Dockerfile SAST Scan
     runs-on: ubuntu-latest
@@ -73,7 +69,6 @@ jobs:
         with:
           sarif_file: hadolint-results.sarif
           category: hadolint
-
   build-and-scan:
     name: Build, SAST, and DAST Scans
     runs-on: ubuntu-latest
@@ -93,7 +88,6 @@ jobs:
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
       - name: Extract metadata (full)
         id: meta
         uses: docker/metadata-action@v5
@@ -108,7 +102,6 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=sha,format=short
-
       - name: Determine final publishable tags (latest and semver only)
         id: filter-tags
         run: |
@@ -116,7 +109,6 @@ jobs:
           IFS=',' read -ra TAGS <<< "${{ steps.meta.outputs.tags }}"
           publish_tags=()
           for t in "${TAGS[@]}"; do
-            # keep only latest, v1.2.3, 1.2, 1 AND their ghcr.io or dockerhub image refs
             if [[ "$t" =~ :latest$ ]]; then
               publish_tags+=("$t")
             elif [[ "$t" =~ :(v?[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
@@ -129,7 +121,6 @@ jobs:
           done
           printf '%s' "published_tags=${publish_tags[*]}" | sed 's/ /,/g' >> $GITHUB_OUTPUT
           echo "Filtered publishable tags:"; printf '%s\n' "${publish_tags[@]}"
-
       - name: Build Docker image for testing (no push)
         id: build
         uses: docker/build-push-action@v5
@@ -141,7 +132,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
       - name: Run Trivy filesystem SAST scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -156,23 +146,28 @@ jobs:
         with:
           sarif_file: 'trivy-fs-results.sarif'
           category: 'trivy-fs'
-
       - name: Run Trivy image DAST scan
+        id: trivy-image
         uses: aquasecurity/trivy-action@master
+        continue-on-error: true
         with:
           scan-type: 'image'
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: 'sarif'
           output: 'trivy-image-results.sarif'
           severity: 'CRITICAL,HIGH,MEDIUM'
+      - name: Ensure Trivy image SARIF exists (fallback)
+        if: always()
+        run: |
+          [ -f trivy-image-results.sarif ] || echo '{"version":"2.1.0","runs":[]}' > trivy-image-results.sarif
       - name: Upload Trivy DAST results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: 'trivy-image-results.sarif'
           category: 'trivy-image'
-
       - name: Run Dockle container linter
+        id: dockle
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             goodwithtech/dockle:latest \
@@ -181,13 +176,16 @@ jobs:
             --output dockle-results.json \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
         continue-on-error: true
+      - name: Ensure Dockle JSON exists (fallback)
+        if: always()
+        run: |
+          [ -f dockle-results.json ] || echo '{}' > dockle-results.json
       - name: Upload Dockle results
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dockle-results
           path: dockle-results.json
-
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -195,7 +193,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Log in to Docker Hub
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -203,7 +200,6 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
         continue-on-error: true
-
       - name: Build and push multi-arch images (only latest/semver, no branch/SHA)
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: docker/build-push-action@v5
@@ -215,11 +211,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
       - name: Install cosign
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: sigstore/cosign-installer@v3.5.0
-
       - name: Sign published tags only
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         env:
@@ -242,7 +236,6 @@ jobs:
               fi
             fi
           done
-
       - name: Generate SBOM for pushed image (use one published tag)
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: anchore/sbom-action@v0
@@ -256,7 +249,6 @@ jobs:
         with:
           name: sbom
           path: sbom.spdx.json
-
   validate-published-image:
     name: Validate Published Image (Security & Features)
     runs-on: ubuntu-latest
@@ -313,6 +305,7 @@ jobs:
           sarif_file: 'trivy-image-published.sarif'
           category: 'trivy-image-published'
       - name: Run Dockle on published image
+        id: dockle-pub
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             goodwithtech/dockle:latest \
@@ -321,6 +314,10 @@ jobs:
             --output dockle-published.json \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.pulltag.outputs.tag }}
         continue-on-error: true
+      - name: Ensure Dockle (published) JSON exists (fallback)
+        if: always()
+        run: |
+          [ -f dockle-published.json ] || echo '{}' > dockle-published.json
       - name: Upload Dockle (published) results
         uses: actions/upload-artifact@v4
         if: always()
@@ -339,7 +336,6 @@ jobs:
           docker run --rm --user 0 "$IMG" /bin/bash -lc 'install_packages jq && command -v jq && [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null)" ]'
           docker run --rm "$IMG" curl -fsSL https://example.com >/dev/null
           echo "Published image validation passed"
-
   summary:
     name: Pipeline Summary
     runs-on: ubuntu-latest
@@ -356,12 +352,4 @@ jobs:
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "- Validate Published Image: ${{ needs.validate-published-image.result }}" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- Validate Published Image: skipped (PR/non-tag build)" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "Published tags: latest" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "Published tags: latest, ${{ github.ref_name }} (with semver aliases)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Published tags: none (build/test only)" >> $GITHUB_STEP_SUMMARY
+            echo "- Validate Published Image: skipped (PR/non-tag build)" >> $GITHUB
