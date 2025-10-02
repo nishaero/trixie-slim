@@ -1,12 +1,10 @@
 # trixie-slim
-
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://github.com/nishaero/trixie-slim)
 
 Minimal Debian Trixie base image designed for production workloads with security best practices built-in. A lightweight, secure, and MIT-licensed alternative to minideb with Bitnami compatibility.
 
 ## Table of Contents
-
 - [Features](#features)
 - [Quick Start](#quick-start)
 - [Installation](#installation)
@@ -17,11 +15,11 @@ Minimal Debian Trixie base image designed for production workloads with security
 - [Security Features](#security-features)
 - [Architecture](#architecture)
 - [Contributing](#contributing)
+- [LLM One-Shot Setup Prompt](#llm-one-shot-setup-prompt)
 - [License](#license)
 - [Support](#support)
 
 ## Features
-
 ✅ **Lightweight** - Based on official `debian:trixie-slim` (~74MB)
 ✅ **Secure** - Non-root default user, hardened security configuration
 ✅ **MIT Licensed** - No copyleft restrictions, free for commercial use
@@ -394,20 +392,21 @@ Contributions are welcome! Please follow these guidelines:
 - ✅ Ensure CI/CD pipeline passes
 - ✅ Test on multiple platforms if possible
 
-### Code of Conduct
 
-This project follows the [GitHub Community Guidelines](https://docs.github.com/articles/github-community-guidelines).
+## LLM One-Shot Setup Prompt
 
-### Reporting Issues
+<details>
+<summary>⚡️ Automated End-to-End CI/CD & Hardened Image Creation Prompt (for LLMs)</summary>
 
-Found a bug or have a suggestion?
+Copy and paste this prompt into any LLM to recreate a minimal, secure, multi-arch, Bitnami-style base image pipeline with full CI/CD, semantic tags, Docker Hub/GHCR push, signing, and final validation. Only provide your repo name!
 
-1. Check existing issues first
-2. Create a new issue with:
-   - Clear description
-   - Steps to reproduce (for bugs)
-   - Expected vs actual behavior
-   - Environment details (Docker version, OS, etc.)
+**Prompt:**
+
+You're an expert in secure container image pipelines. I want a reproducible, production-ready, minimal Debian Trixie base image project like Bitnami/minideb, but with improved hardening and modern supply chain security. Please do all of the following, with no further interaction:
+
+- **Create Dockerfile:** ... (rest of LLM prompt as given)
+
+</details>
 
 ## License
 
