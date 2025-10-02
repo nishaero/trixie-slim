@@ -33,7 +33,7 @@ jobs:
       - name: Find shell scripts
         id: files
         run: |
-          echo "files=$(git ls-files | grep -E '\\.(sh|bash)$|/usr/local/bin/install_packages$' || true)" >> $GITHUB_OUTPUT
+          echo "files=$(git ls-files | grep -E '\.(sh|bash)$|/usr/local/bin/install_packages$' || true)" >> $GITHUB_OUTPUT
       - name: Run shfmt (check only)
         if: steps.files.outputs.files != ''
         run: |
@@ -179,7 +179,7 @@ jobs:
           out=$(docker run --rm "$IMAGE" /bin/bash -lc 'echo $LANG $LC_ALL && locale -a | grep -i en_US.utf8')
           echo "$out"
           # 4) Validate install_packages works and cleans cache
-          docker run --rm --user 0 "$IMAGE" /bin/bash -lc 'install_packages jq && command -v jq && [ ! -d /var/lib/apt/lists ]'
+          docker run --rm --user 0 "$IMAGE" /bin/bash -lc 'install_packages jq && command -v jq && [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null)" ]'
           # 5) Basic networking and certs
           docker run --rm "$IMAGE" curl -fsSL https://example.com >/dev/null
           echo "Runtime checks passed"
