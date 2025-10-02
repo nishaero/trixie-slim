@@ -36,7 +36,7 @@ jobs:
       - name: Find shell scripts
         id: files
         run: |
-          echo "files=$(git ls-files | grep -E '\.(sh|bash)$|/usr/local/bin/install_packages$' || true)" >> $GITHUB_OUTPUT
+          echo "files=$(git ls-files | grep -E '\\.(sh|bash)$|/usr/local/bin/install_packages$' || true)" >> $GITHUB_OUTPUT
       - name: Run shfmt (check only)
         if: steps.files.outputs.files != ''
         run: |
@@ -81,6 +81,7 @@ jobs:
       contents: read
       packages: write
       security-events: write
+      id-token: write  # for keyless cosign
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
       image-ref: ${{ steps.meta.outputs.tags }}
@@ -217,6 +218,32 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Install cosign
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: sigstore/cosign-installer@v3.5.0
+      - name: Sign multi-arch images with cosign (keyless or key-based)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        env:
+          COSIGN_EXPERIMENTAL: 'true'
+          COSIGN_YES: 'true'
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Iterate over all tags produced by metadata-action
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | while read -r TAG; do
+            [ -z "$TAG" ] && continue
+            if echo "$TAG" | grep -q '^ghcr.io\|^nishaero/'; then
+              echo "Signing $TAG"
+              if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
+                echo "$COSIGN_PRIVATE_KEY" | base64 -d > cosign.key
+                cosign sign --key cosign.key "$TAG"
+                rm -f cosign.key
+              else
+                cosign sign "$TAG"
+              fi
+            fi
+          done
       - name: Generate SBOM
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: anchore/sbom-action@v0
@@ -261,12 +288,12 @@ jobs:
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "🌙 **Nightly rebuild completed** - Image updated with latest security patches" >> $GITHUB_STEP_SUMMARY
           elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "✅ **Multi-arch images published to GHCR and Docker Hub**" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Multi-arch images published, signed, and pushed**" >> $GITHUB_STEP_SUMMARY
             echo "- GHCR: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
             echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
             echo "- Architectures: linux/amd64, linux/arm64, linux/arm/v7" >> $GITHUB_STEP_SUMMARY
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "🏷️ **Semantic versioned release published**" >> $GITHUB_STEP_SUMMARY
+            echo "🏷️ **Semantic versioned release published and signed**" >> $GITHUB_STEP_SUMMARY
             echo "- Version: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
             echo "- GHCR: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
             echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
