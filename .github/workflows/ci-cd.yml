@@ -97,19 +97,22 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Login to Docker Hub (optional, only if credentials are configured)
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
+          # GHCR always included, Docker Hub added if credentials exist
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKERHUB_IMAGE }}
+            ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_IMAGE || '' }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -196,7 +199,7 @@ jobs:
           # 5) Basic networking and certs
           docker run --rm "$IMAGE" curl -fsSL https://example.com >/dev/null
           echo "Runtime checks passed"
-      # Multi-arch build and push to both GHCR and Docker Hub
+      # Multi-arch build and push to GHCR (and Docker Hub if credentials configured)
       # NOTE: Extensible - add more architectures as needed (e.g., linux/ppc64le, linux/s390x)
       - name: Build and push multi-arch Docker images
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -255,9 +258,11 @@ jobs:
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "🌙 **Nightly rebuild completed** - Image updated with latest security patches" >> $GITHUB_STEP_SUMMARY
           elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "✅ **Multi-arch images published to GHCR and Docker Hub**" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Multi-arch images published to GHCR (and Docker Hub if configured)**" >> $GITHUB_STEP_SUMMARY
             echo "- GHCR: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
-            echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
+            if [[ "${{ secrets.DOCKERHUB_USERNAME }}" != "" ]] && [[ "${{ secrets.DOCKERHUB_TOKEN }}" != "" ]]; then
+              echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
+            fi
             echo "- Architectures: linux/amd64, linux/arm64, linux/arm/v7" >> $GITHUB_STEP_SUMMARY
           else
             echo "🔍 **PR validation completed** - Ready for review" >> $GITHUB_STEP_SUMMARY
