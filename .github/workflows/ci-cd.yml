@@ -3,6 +3,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*.*.*'
   pull_request:
     branches:
       - main
@@ -118,6 +120,7 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
             type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
@@ -202,7 +205,7 @@ jobs:
       # Multi-arch build and push to GHCR (and Docker Hub if credentials configured)
       # NOTE: Extensible - add more architectures as needed (e.g., linux/ppc64le, linux/s390x)
       - name: Build and push multi-arch Docker images
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -215,20 +218,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Generate SBOM
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: anchore/sbom-action@v0
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: spdx-json
           output-file: sbom.spdx.json
       - name: Upload SBOM
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: actions/upload-artifact@v4
         with:
           name: sbom
           path: sbom.spdx.json
       - name: Make GHCR package public
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         run: |
           # Requires GITHUB_TOKEN with packages:write and repo scope (default in actions)
           OWNER=${{ github.repository_owner }}
@@ -262,6 +265,11 @@ jobs:
             echo "- GHCR: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
             echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
             echo "- Architectures: linux/amd64, linux/arm64, linux/arm/v7" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "🏷️ **Semantic versioned release published**" >> $GITHUB_STEP_SUMMARY
+            echo "- Version: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- GHCR: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Docker Hub: nishaero/trixie-slim" >> $GITHUB_STEP_SUMMARY
           else
             echo "🔍 **PR validation completed** - Ready for review" >> $GITHUB_STEP_SUMMARY
           fi
