@@ -17,3 +17,4 @@ Minimal Debian Trixie base image designed for production workloads with security
 - [Architecture](#architecture)
 
 <!-- Test commit to trigger pipeline -->
+<!-- Testing auto-tag workflow -->
