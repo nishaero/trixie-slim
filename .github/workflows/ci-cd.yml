@@ -89,10 +89,7 @@ jobs:
           VALIDATE_ALL_CODEBASE: false
           DEFAULT_BRANCH: main
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VALIDATE_MARKDOWN: true
-          VALIDATE_BASH: true
-          VALIDATE_YAML: true
-          VALIDATE_DOCKERFILE_HADOLINT: false  # Separate step below
+          VALIDATE_DOCKERFILE_HADOLINT: false
 
   # Lint Dockerfile with Hadolint (strict)
   dockerfile-lint:
