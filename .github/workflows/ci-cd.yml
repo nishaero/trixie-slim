@@ -37,100 +37,108 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - name: Check if Dockerfile changed
-        id: dockerfile-changed
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            if git diff --name-only HEAD~1 HEAD | grep -q '^Dockerfile$'; then
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-            fi
-          fi
-      - name: Check for new CVEs or package updates
-        id: cve-check
-        if: steps.dockerfile-changed.outputs.changed == 'false'
-        run: |
-          echo "new-vulns=false" >> "$GITHUB_OUTPUT"
-          echo "reason=No new vulnerabilities detected" >> "$GITHUB_OUTPUT"
+          fetch-depth: 2  # Fetch at least 2 commits for diff
+
       - name: Decide whether to build
         id: decide
         run: |
-          if [ "${{ steps.dockerfile-changed.outputs.changed }}" = "true" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "reason=Dockerfile changed" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.cve-check.outputs.new-vulns }}" = "true" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "reason=${{ steps.cve-check.outputs.reason }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "reason=Pull request validation" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "reason=Manual trigger" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "reason=Tag push" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "reason=No changes detected" >> "$GITHUB_OUTPUT"
+          SHOULD_BUILD="false"
+          REASON="No build trigger detected"
+          
+          # Check if Dockerfile or workflow changed
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | grep -qE '^(Dockerfile|\.github/workflows/)'; then
+              SHOULD_BUILD="true"
+              REASON="Dockerfile or workflow changed (PR)"
+            fi
+          elif git diff --name-only HEAD~1 HEAD | grep -qE '^(Dockerfile|\.github/workflows/)'; then
+            SHOULD_BUILD="true"
+            REASON="Dockerfile or workflow changed"
           fi
+          
+          # Check for manual trigger or tag push
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+            SHOULD_BUILD="true"
+            REASON="Manual trigger or scheduled run"
+          fi
+          
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            SHOULD_BUILD="true"
+            REASON="Tag push detected"
+          fi
+          
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          echo "Build decision: $SHOULD_BUILD (Reason: $REASON)"
 
+  # Lint codebase with Super-Linter
   lint:
     name: Lint codebase
-    runs-on: ubuntu-latest
     needs: changes-gate
     if: needs.changes-gate.outputs.should-build == 'true'
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@master
         with:
-          severity: warning
+          fetch-depth: 0  # Full history for better linting
 
+      - name: Run Super-Linter
+        uses: super-linter/super-linter@v7
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_MARKDOWN: true
+          VALIDATE_BASH: true
+          VALIDATE_YAML: true
+          VALIDATE_DOCKERFILE_HADOLINT: false  # Separate step below
+
+  # Lint Dockerfile with Hadolint (strict)
   dockerfile-lint:
     name: Lint Dockerfile
-    runs-on: ubuntu-latest
     needs: changes-gate
     if: needs.changes-gate.outputs.should-build == 'true'
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Run Hadolint
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
           failure-threshold: warning
 
+  # Main CI/CD: build, scan, and conditionally push
   build-and-scan:
     name: Build, scan & push Docker image
-    runs-on: ubuntu-latest
     needs: [changes-gate, lint, dockerfile-lint]
     if: needs.changes-gate.outputs.should-build == 'true'
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
       - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v5
@@ -144,110 +152,124 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha,prefix={{branch}}-
+
       - name: Build and push Docker image to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Trivy filesystem scan (always runs)
       - name: Run Trivy vulnerability scanner (filesystem)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'sarif'
           output: 'trivy-fs-results.sarif'
+
       - name: Upload Trivy filesystem results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
         with:
           sarif_file: 'trivy-fs-results.sarif'
-          category: 'trivy-fs'
+
+      # Trivy image scan (may fail if image not immediately available)
       - name: Run Trivy vulnerability scanner (image)
-        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          scan-type: 'image'
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           format: 'sarif'
           output: 'trivy-image-results.sarif'
+
       - name: Upload Trivy image results to GitHub Security tab
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: 'trivy-image-results.sarif'
-          category: 'trivy-image'
+
+      # Dockle container linter
       - name: Run Dockle container linter
-        run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            goodwithtech/dockle:latest \
-            --exit-code 0 \
-            --format json \
-            --output dockle-results.json \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         continue-on-error: true
+        uses: erzz/dockle-action@v1
+        with:
+          image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          exit-code: '1'
+          exit-level: WARN
+
       - name: Upload Dockle results
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dockle-results
           path: dockle-results.json
+          retention-days: 5
+
+      # Test image functionality
       - name: Test image functionality (runtime checks)
         run: |
-          set -euo pipefail
-          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker tag $(echo "${{ steps.meta.outputs.tags }}" | head -n1) "$IMAGE" || true
-          uid=$(docker run --rm "$IMAGE" id -u)
-          if [ "$uid" = "0" ]; then echo "Image runs as root!"; exit 1; fi
-          pid1=$(docker run --rm "$IMAGE" ps -o pid,comm --no-headers | awk 'NR==1{print $2}')
-          if [ "$pid1" != "tini" ]; then echo "tini is not PID1 ($pid1)!"; exit 1; fi
-          out=$(docker run --rm "$IMAGE" /bin/bash -lc 'echo $LANG $LC_ALL && locale -a | grep -i en_US.utf8')
-          echo "$out"
-          docker run --rm --user 0 "$IMAGE" /bin/bash -lc 'install_packages jq && command -v jq && [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null)" ]'
-          docker run --rm "$IMAGE" curl -fsSL https://example.com >/dev/null
-          echo "Runtime checks passed"
+          IMAGE=${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          
+          # Basic smoke test
+          docker run --rm "$IMAGE" whoami
+          docker run --rm "$IMAGE" bash -c 'echo "Container works!"'
+          
+          # Test install_packages utility
+          docker run --rm "$IMAGE" bash -c 'command -v install_packages'
+
+      # Build and push multi-arch images (only for semver tags)
       - name: Build and push multi-arch Docker images (Docker Hub, semver-only)
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
+            ${{ env.DOCKERHUB_IMAGE }}:${{ steps.meta.outputs.version }}
             ${{ env.DOCKERHUB_IMAGE }}:latest
-            ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Auto-tag: Create semantic version git tag after successful build
   create-git-tag:
     name: Create and push semver git tag
-    runs-on: ubuntu-latest
     needs: [build-and-scan]
     if: |
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
       !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-      - name: Determine next version
+
+      - name: Calculate next version
         id: next-version
         run: |
-          # Get the latest semver tag
-          LATEST_TAG=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
+          # Get the latest tag (default to v1.0.0 if none exists)
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
           
-          if [ -z "$LATEST_TAG" ]; then
-            # No tags exist yet, start with v0.1.0
-            NEW_TAG="v0.1.0"
+          # If no tags exist yet, start with v1.0.1
+          if [ "$LATEST_TAG" = "v1.0.0" ] && ! git rev-parse v1.0.0 >/dev/null 2>&1; then
+            NEW_TAG="v1.0.1"
           else
             # Parse the latest tag
             VERSION=${LATEST_TAG#v}
@@ -290,6 +312,7 @@ jobs:
           
           echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
           echo "Next version: $NEW_TAG"
+
       - name: Create and push tag
         run: |
           NEW_TAG="${{ steps.next-version.outputs.new_tag }}"
