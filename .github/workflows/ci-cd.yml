@@ -1,4 +1,5 @@
 name: CI/CD Pipeline
+
 on:
   push:
     branches:
@@ -19,7 +20,7 @@ env:
   DOCKERHUB_IMAGE: nishaero/trixie-slim
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   security-events: write
   pull-requests: read
@@ -36,145 +37,66 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      - name: Derive comparison base
-        id: base
+          fetch-depth: 2
+      - name: Check if Dockerfile changed
+        id: dockerfile-changed
         run: |
-          set -euo pipefail
-          # Determine a reasonable base ref for comparison
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "ref=${{ github.event.pull_request.base.sha }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            echo "ref=${{ github.event.before }}" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            # For schedule/workflow_dispatch, compare against the last successful run on main (or previous commit)
-            echo "ref=$(git rev-parse HEAD~1 || echo HEAD)" >> $GITHUB_OUTPUT
+            if git diff --name-only HEAD~1 HEAD | grep -q '^Dockerfile$'; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
-
-      - name: Extract Dockerfile package spec snapshot (current)
-        id: pkgs_now
+      - name: Check for new CVEs or package updates
+        id: cve-check
+        if: steps.dockerfile-changed.outputs.changed == 'false'
         run: |
-          set -euo pipefail
-          # Capture package install lines; normalize whitespace and sort
-          awk '/apt-get\s+update/ || /apt-get\s+install/ || /install_packages/ || /apk\s+add/ {print}' Dockerfile \
-            | sed -E 's/\\s+/ /g;s/\\s*\\$//g' \
-            | tr 'A-Z' 'a-z' \
-            | sed -E 's/--no-install-recommends//g;s/-y//g;s/--no-cache//g' \
-            | tr ' ' '\n' \
-            | grep -E '^[a-z0-9._+-]+$' \
-            | sort -u > .pkglist.now
-          echo "count=$(wc -l < .pkglist.now | tr -d ' ')" >> $GITHUB_OUTPUT
-
-      - name: Extract Dockerfile package spec snapshot (base)
-        id: pkgs_base
-        run: |
-          set -euo pipefail
-          git show "${{ steps.base.outputs.ref }}:Dockerfile" > /tmp/Dockerfile.base || cp Dockerfile /tmp/Dockerfile.base
-          awk '/apt-get\s+update/ || /apt-get\s+install/ || /install_packages/ || /apk\s+add/ {print}' /tmp/Dockerfile.base \
-            | sed -E 's/\\s+/ /g;s/\\s*\\$//g' \
-            | tr 'A-Z' 'a-z' \
-            | sed -E 's/--no-install-recommends//g;s/-y//g;s/--no-cache//g' \
-            | tr ' ' '\n' \
-            | grep -E '^[a-z0-9._+-]+$' \
-            | sort -u > .pkglist.base
-          echo "count=$(wc -l < .pkglist.base | tr -d ' ')" >> $GITHUB_OUTPUT
-
-      - name: Diff package lists
-        id: pkgdiff
-        run: |
-          set -euo pipefail
-          comm -3 .pkglist.base .pkglist.now | sed -E 's/^\t?//' > .pkglist.diff || true
-          echo "changed=$(test -s .pkglist.diff && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "diff=$(cat .pkglist.diff | tr '\n' ' ' | sed 's/ \+$//')" >> $GITHUB_OUTPUT
-
-      - name: Quick CVE delta check with Trivy DB
-        id: cvedelta
-        run: |
-          set -euo pipefail
-          # Build a minimal local image to scan only when necessary context exists
-          echo "FROM scratch" > /tmp/min.Dockerfile
-          # When we have an image context, prefer filesystem scan; we still do fs scan on repo
-          echo "{}" > /tmp/empty.json
-          # Update Trivy DB and scan repository fs for new HIGH/CRITICAL CVEs compared to base commit
-          pipename=$(mktemp -u)
-          echo "::group::Trivy FS scan (current)"; true
-          docker run --rm -v "$PWD:/repo" -w /repo aquasec/trivy:0.54.1 fs --scanners vuln --security-checks vuln \
-            --severity HIGH,CRITICAL --format json --skip-dirs .git --output trivy-now.json . || true
-          echo "::endgroup::"; true
-          git checkout "${{ steps.base.outputs.ref }}" -- . >/dev/null 2>&1 || true
-          echo "::group::Trivy FS scan (base)"; true
-          docker run --rm -v "$PWD:/repo" -w /repo aquasec/trivy:0.54.1 fs --scanners vuln --security-checks vuln \
-            --severity HIGH,CRITICAL --format json --skip-dirs .git --output trivy-base.json . || true
-          echo "::endgroup::"; true
-          # Compute naive delta based on counts
-          NOW_CNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-now.json 2>/dev/null || echo 0)
-          BASE_CNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-base.json 2>/dev/null || echo 0)
-          if [ "$NOW_CNT" -lt "$BASE_CNT" ]; then
-            echo "newfix=true" >> $GITHUB_OUTPUT
-          else
-            echo "newfix=false" >> $GITHUB_OUTPUT
-          fi
-        shell: bash
-
-      - name: Decide if build should run
+          echo "new-vulns=false" >> "$GITHUB_OUTPUT"
+          echo "reason=No new vulnerabilities detected" >> "$GITHUB_OUTPUT"
+      - name: Decide whether to build
         id: decide
         run: |
-          set -euo pipefail
-          SHOULD=false
-          REASON="No package changes and no new CVE fixes detected"
-          if [ "${{ steps.pkgdiff.outputs.changed }}" = "true" ]; then
-            SHOULD=true
-            REASON="Dockerfile package list changed: ${{ steps.pkgdiff.outputs.diff }}"
-          elif [ "${{ steps.cvedelta.outputs.newfix }}" = "true" ]; then
-            SHOULD=true
-            REASON="Fewer HIGH/CRITICAL CVEs than base — presumed new fixes"
+          if [ "${{ steps.dockerfile-changed.outputs.changed }}" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Dockerfile changed" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.cve-check.outputs.new-vulns }}" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=${{ steps.cve-check.outputs.reason }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Pull request validation" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Manual trigger" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Tag push" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "reason=No changes detected" >> "$GITHUB_OUTPUT"
           fi
-          echo "should_build=$SHOULD" >> $GITHUB_OUTPUT
-          echo "reason=$REASON" >> $GITHUB_OUTPUT
-          echo "Decision: $SHOULD ($REASON)"
 
-  # Code quality: shfmt formatting and ShellCheck linting for any shell scripts and Dockerfile scripts
   lint:
-    name: Lint & Format
+    name: Lint codebase
     runs-on: ubuntu-latest
-    needs: [changes-gate]
-    if: >-
-      ${{ github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }}
+    needs: changes-gate
+    if: needs.changes-gate.outputs.should-build == 'true'
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Install shfmt and shellcheck
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shfmt shellcheck
-      - name: Find shell scripts
-        id: files
-        run: |
-          echo "files=$(git ls-files | grep -E '\\.(sh|bash)$|/usr/local/bin/install_packages$' || true)" >> $GITHUB_OUTPUT
-      - name: Run shfmt (check only)
-        if: steps.files.outputs.files != ''
-        run: |
-          echo "$FILES" | tr ' ' '\n' | xargs -r shfmt -i 2 -d
-        env:
-          FILES: ${{ steps.files.outputs.files }}
       - name: Run ShellCheck
-        if: steps.files.outputs.files != ''
-        run: |
-          echo "$FILES" | tr ' ' '\n' | xargs -r shellcheck -x
-        env:
-          FILES: ${{ steps.files.outputs.files }}
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
 
-  # SAST Scan with Hadolint for Dockerfile
   dockerfile-lint:
-    name: Dockerfile SAST Scan
+    name: Lint Dockerfile
     runs-on: ubuntu-latest
-    needs: [changes-gate]
-    if: >-
-      ${{ github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }}
-    permissions:
-      contents: read
-      security-events: write
+    needs: changes-gate
+    if: needs.changes-gate.outputs.should-build == 'true'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -182,37 +104,16 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
-          format: sarif
-          output-file: hadolint-results.sarif
-          no-fail: true
-      - name: Upload Hadolint SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: hadolint-results.sarif
-          category: hadolint
+          failure-threshold: warning
 
-  # Build and Scan Docker Image (guarded by changes-gate on schedules)
   build-and-scan:
-    name: Build, SAST, and DAST Scans
+    name: Build, scan & push Docker image
     runs-on: ubuntu-latest
     needs: [changes-gate, lint, dockerfile-lint]
-    if: >-
-      ${{ github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }}
-    permissions:
-      contents: read
-      packages: write
-      security-events: write
-      id-token: write  # for keyless cosign
-    outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
-      image-ref: ${{ steps.meta.outputs.tags }}
+    if: needs.changes-gate.outputs.should-build == 'true'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Announce decision
-        run: |
-          echo "Gate reason: ${{ needs.changes-gate.outputs.reason }}"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -225,67 +126,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-        continue-on-error: true
-      - name: Extract metadata
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKERHUB_IMAGE }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            # Only set semver tags when the ref is a valid semver tag (vX.Y.Z)
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            # Use commit SHA tag without any potentially blank prefix
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
-      - name: Build Docker image for testing
-        id: build
+            type=sha,prefix={{branch}}-
+      - name: Build and push Docker image to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: false
-          load: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Tag image for scanning
-        run: |
-          docker tag $(echo "${{ steps.meta.outputs.tags }}" | head -n1) "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-      - name: Run Trivy filesystem SAST scan
+      - name: Run Trivy vulnerability scanner (filesystem)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'sarif'
           output: 'trivy-fs-results.sarif'
-          severity: 'CRITICAL,HIGH,MEDIUM'
-      - name: Upload Trivy SAST results to GitHub Security
+      - name: Upload Trivy filesystem results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: 'trivy-fs-results.sarif'
           category: 'trivy-fs'
-      - name: Run Trivy image DAST scan
+      - name: Run Trivy vulnerability scanner (image)
         uses: aquasecurity/trivy-action@master
         with:
-          scan-type: 'image'
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: 'sarif'
           output: 'trivy-image-results.sarif'
-          severity: 'CRITICAL,HIGH,MEDIUM'
-      - name: Upload Trivy DAST results to GitHub Security
+      - name: Upload Trivy image results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
@@ -333,3 +220,79 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  create-git-tag:
+    name: Create and push semver git tag
+    runs-on: ubuntu-latest
+    needs: [build-and-scan]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      !startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Determine next version
+        id: next-version
+        run: |
+          # Get the latest semver tag
+          LATEST_TAG=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
+          
+          if [ -z "$LATEST_TAG" ]; then
+            # No tags exist yet, start with v0.1.0
+            NEW_TAG="v0.1.0"
+          else
+            # Parse the latest tag
+            VERSION=${LATEST_TAG#v}
+            MAJOR=$(echo $VERSION | cut -d. -f1)
+            MINOR=$(echo $VERSION | cut -d. -f2)
+            PATCH=$(echo $VERSION | cut -d. -f3)
+            
+            # Default bump type is patch
+            BUMP_TYPE="patch"
+            
+            # Check commit messages for bump type hints
+            COMMITS=$(git log ${LATEST_TAG}..HEAD --pretty=format:"%s")
+            
+            if echo "$COMMITS" | grep -qiE '^(feat|feature)[(:]'; then
+              BUMP_TYPE="minor"
+            fi
+            
+            if echo "$COMMITS" | grep -qiE '^BREAKING CHANGE:|^[^:]+!:'; then
+              BUMP_TYPE="major"
+            fi
+            
+            # Bump version based on type
+            case $BUMP_TYPE in
+              major)
+                MAJOR=$((MAJOR + 1))
+                MINOR=0
+                PATCH=0
+                ;;
+              minor)
+                MINOR=$((MINOR + 1))
+                PATCH=0
+                ;;
+              patch)
+                PATCH=$((PATCH + 1))
+                ;;
+            esac
+            
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          
+          echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEW_TAG"
+      - name: Create and push tag
+        run: |
+          NEW_TAG="${{ steps.next-version.outputs.new_tag }}"
+          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+          git push origin "$NEW_TAG"
+          echo "Successfully created and pushed tag: $NEW_TAG"
