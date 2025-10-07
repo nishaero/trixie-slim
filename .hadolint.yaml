@@ -1,0 +1,8 @@
+# Hadolint configuration
+# https://github.com/hadolint/hadolint
+
+ignored:
+  # DL3008: Pin versions in apt-get install
+  # Rationale: Using latest versions from Debian stable is acceptable for base images
+  # and provides automatic security updates without manual intervention
+  - DL3008
