@@ -35,9 +35,11 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    tini \
     sudo \
-    tini && \
-    rm -rf /var/lib/apt/lists/*
+    procps \
+    && apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # ================================
 # CREATE NON-ROOT USER & GROUPS
@@ -91,11 +93,16 @@ RUN find / -xdev -type f \( -perm -4000 -o -perm -2000 \) \
     ! -path "/usr/lib/dbus-1.0/dbus-daemon-launch-helper" \
     ! -path "/bin/mount" \
     ! -path "/bin/umount" \
-    -exec chmod -s {} \; 2>/dev/null || true
+    ! -path "/usr/bin/newgrp" \
+    ! -path "/usr/bin/chsh" \
+    ! -path "/usr/bin/chfn" \
+    ! -path "/usr/bin/passwd" \
+    ! -path "/usr/bin/gpasswd" \
+    -exec chmod -s {} \; 2>/dev/null
 
 # 2. Remove world-writable files and directories (except /tmp, /var/tmp)
-RUN find / -xdev -type d -perm /0002 -not -path "/tmp*" -not -path "/var/tmp*" -not -path "/proc*" -not -path "/sys*" -exec chmod o-w {} \; 2>/dev/null || true && \
-    find / -xdev -type f -perm /0002 -not -path "/proc*" -not -path "/sys*" -exec chmod o-w {} \; 2>/dev/null || true
+RUN find / -xdev -type d -perm /0002 -not -path "/tmp*" -not -path "/var/tmp*" -not -path "/proc*" -not -path "/sys*" -exec chmod o-w {} \; 2>/dev/null; \
+    find / -xdev -type f -perm /0002 -not -path "/proc*" -not -path "/sys*" -exec chmod o-w {} \; 2>/dev/null
 
 # 3. Minimize attack surface - remove documentation, logs, and caches
 RUN rm -rf \
@@ -106,12 +113,12 @@ RUN rm -rf \
     /var/log/* \
     /usr/share/common-licenses/* \
     /usr/share/lintian/* \
-    /usr/share/bug/* 2>/dev/null || true && \
-    find /var/log -type f -exec truncate -s 0 {} \; 2>/dev/null || true
+    /usr/share/bug/* 2>/dev/null; \
+    find /var/log -type f -exec truncate -s 0 {} \; 2>/dev/null
 
 # 4. Secure file permissions
-RUN chmod 755 /usr/bin/* /usr/sbin/* /bin/* /sbin/* 2>/dev/null || true && \
-    chmod 700 /root 2>/dev/null || true && \
+RUN chmod 755 /usr/bin/* /usr/sbin/* /bin/* /sbin/* 2>/dev/null; \
+    chmod 700 /root 2>/dev/null; \
     chmod 1777 /tmp /var/tmp
 
 # 5. Create minimal directory structure for apps
