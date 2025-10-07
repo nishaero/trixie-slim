@@ -9,23 +9,138 @@ on:
     branches:
       - main
   schedule:
-    # Nightly rebuild at 2 AM UTC to pull in latest security updates
+    # Nightly check at 2 AM UTC to detect package/CVE changes; only build if needed
     - cron: '0 2 * * *'
   workflow_dispatch:
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   DOCKERHUB_IMAGE: nishaero/trixie-slim
+
 permissions:
   contents: read
   packages: write
   security-events: write
   pull-requests: read
+
 jobs:
+  # Gatekeeper: decide whether to run build based on Dockerfile package changes or new CVEs
+  changes-gate:
+    name: Detect package or vulnerability changes
+    runs-on: ubuntu-latest
+    outputs:
+      should-build: ${{ steps.decide.outputs.should_build }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive comparison base
+        id: base
+        run: |
+          set -euo pipefail
+          # Determine a reasonable base ref for comparison
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=${{ github.event.pull_request.base.sha }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "ref=${{ github.event.before }}" >> $GITHUB_OUTPUT
+          else
+            # For schedule/workflow_dispatch, compare against the last successful run on main (or previous commit)
+            echo "ref=$(git rev-parse HEAD~1 || echo HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Extract Dockerfile package spec snapshot (current)
+        id: pkgs_now
+        run: |
+          set -euo pipefail
+          # Capture package install lines; normalize whitespace and sort
+          awk '/apt-get\s+update/ || /apt-get\s+install/ || /install_packages/ || /apk\s+add/ {print}' Dockerfile \
+            | sed -E 's/\\s+/ /g;s/\\s*\\\\$//g' \
+            | tr 'A-Z' 'a-z' \
+            | sed -E 's/--no-install-recommends//g;s/-y//g;s/--no-cache//g' \
+            | tr ' ' '\n' \
+            | grep -E '^[a-z0-9._+-]+$' \
+            | sort -u > .pkglist.now
+          echo "count=$(wc -l < .pkglist.now | tr -d ' ')" >> $GITHUB_OUTPUT
+
+      - name: Extract Dockerfile package spec snapshot (base)
+        id: pkgs_base
+        run: |
+          set -euo pipefail
+          git show "${{ steps.base.outputs.ref }}:Dockerfile" > /tmp/Dockerfile.base || cp Dockerfile /tmp/Dockerfile.base
+          awk '/apt-get\s+update/ || /apt-get\s+install/ || /install_packages/ || /apk\s+add/ {print}' /tmp/Dockerfile.base \
+            | sed -E 's/\\s+/ /g;s/\\s*\\\\$//g' \
+            | tr 'A-Z' 'a-z' \
+            | sed -E 's/--no-install-recommends//g;s/-y//g;s/--no-cache//g' \
+            | tr ' ' '\n' \
+            | grep -E '^[a-z0-9._+-]+$' \
+            | sort -u > .pkglist.base
+          echo "count=$(wc -l < .pkglist.base | tr -d ' ')" >> $GITHUB_OUTPUT
+
+      - name: Diff package lists
+        id: pkgdiff
+        run: |
+          set -euo pipefail
+          comm -3 .pkglist.base .pkglist.now | sed -E 's/^\t?//' > .pkglist.diff || true
+          echo "changed=$(test -s .pkglist.diff && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "diff=$(cat .pkglist.diff | tr '\n' ' ' | sed 's/ \+$//')" >> $GITHUB_OUTPUT
+
+      - name: Quick CVE delta check with Trivy DB
+        id: cvedelta
+        run: |
+          set -euo pipefail
+          # Build a minimal local image to scan only when necessary context exists
+          echo "FROM scratch" > /tmp/min.Dockerfile
+          # When we have an image context, prefer filesystem scan; we still do fs scan on repo
+          echo "{}" > /tmp/empty.json
+          # Update Trivy DB and scan repository fs for new HIGH/CRITICAL CVEs compared to base commit
+          pipename=$(mktemp -u)
+          echo "::group::Trivy FS scan (current)"; true
+          docker run --rm -v "$PWD:/repo" -w /repo aquasec/trivy:0.54.1 fs --scanners vuln --security-checks vuln \
+            --severity HIGH,CRITICAL --format json --skip-dirs .git --output trivy-now.json . || true
+          echo "::endgroup::"; true
+          git checkout "${{ steps.base.outputs.ref }}" -- . >/dev/null 2>&1 || true
+          echo "::group::Trivy FS scan (base)"; true
+          docker run --rm -v "$PWD:/repo" -w /repo aquasec/trivy:0.54.1 fs --scanners vuln --security-checks vuln \
+            --severity HIGH,CRITICAL --format json --skip-dirs .git --output trivy-base.json . || true
+          echo "::endgroup::"; true
+          # Compute naive delta based on counts
+          NOW_CNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-now.json 2>/dev/null || echo 0)
+          BASE_CNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-base.json 2>/dev/null || echo 0)
+          if [ "$NOW_CNT" -lt "$BASE_CNT" ]; then
+            echo "newfix=true" >> $GITHUB_OUTPUT
+          else
+            echo "newfix=false" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Decide if build should run
+        id: decide
+        run: |
+          set -euo pipefail
+          SHOULD=false
+          REASON="No package changes and no new CVE fixes detected"
+          if [ "${{ steps.pkgdiff.outputs.changed }}" = "true" ]; then
+            SHOULD=true
+            REASON="Dockerfile package list changed: ${{ steps.pkgdiff.outputs.diff }}"
+          elif [ "${{ steps.cvedelta.outputs.newfix }}" = "true" ]; then
+            SHOULD=true
+            REASON="Fewer HIGH/CRITICAL CVEs than base — presumed new fixes"
+          fi
+          echo "should_build=$SHOULD" >> $GITHUB_OUTPUT
+          echo "reason=$REASON" >> $GITHUB_OUTPUT
+          echo "Decision: $SHOULD ($REASON)"
+
   # Code quality: shfmt formatting and ShellCheck linting for any shell scripts and Dockerfile scripts
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
+    needs: [changes-gate]
+    if: >-
+      ${{ github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,10 +164,14 @@ jobs:
           echo "$FILES" | tr ' ' '\n' | xargs -r shellcheck -x
         env:
           FILES: ${{ steps.files.outputs.files }}
+
   # SAST Scan with Hadolint for Dockerfile
   dockerfile-lint:
     name: Dockerfile SAST Scan
     runs-on: ubuntu-latest
+    needs: [changes-gate]
+    if: >-
+      ${!! github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }
     permissions:
       contents: read
       security-events: write
@@ -72,11 +191,14 @@ jobs:
         with:
           sarif_file: hadolint-results.sarif
           category: hadolint
-  # Build and Scan Docker Image
+
+  # Build and Scan Docker Image (guarded by changes-gate on schedules)
   build-and-scan:
     name: Build, SAST, and DAST Scans
     runs-on: ubuntu-latest
-    needs: [lint, dockerfile-lint]
+    needs: [changes-gate, lint, dockerfile-lint]
+    if: >-
+      ${!! github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }
     permissions:
       contents: read
       packages: write
@@ -88,7 +210,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      # Set up QEMU for multi-arch builds (required for ARM emulation on x86 runners)
+      - name: Announce decision
+        run: |
+          echo "Gate reason: ${{ needs.changes-gate.outputs.reason }}"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -100,7 +224,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Login to Docker Hub (optional, only if credentials are configured)
       - name: Log in to Docker Hub
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -124,7 +247,6 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
             type=schedule,pattern=nightly-{{date 'YYYYMMDD'}}
-      # Build for local testing only (single platform for speed)
       - name: Build Docker image for testing
         id: build
         uses: docker/build-push-action@v5
@@ -186,23 +308,16 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          # Build a local tag if needed
           docker tag $(echo "${{ steps.meta.outputs.tags }}" | head -n1) "$IMAGE" || true
-          # 1) Ensure runs as non-root
           uid=$(docker run --rm "$IMAGE" id -u)
           if [ "$uid" = "0" ]; then echo "Image runs as root!"; exit 1; fi
-          # 2) Ensure tini is PID 1
           pid1=$(docker run --rm "$IMAGE" ps -o pid,comm --no-headers | awk 'NR==1{print $2}')
           if [ "$pid1" != "tini" ]; then echo "tini is not PID1 ($pid1)!"; exit 1; fi
-          # 3) Validate locale
           out=$(docker run --rm "$IMAGE" /bin/bash -lc 'echo $LANG $LC_ALL && locale -a | grep -i en_US.utf8')
           echo "$out"
-          # 4) Validate install_packages works and cleans cache
           docker run --rm --user 0 "$IMAGE" /bin/bash -lc 'install_packages jq && command -v jq && [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null)" ]'
-          # 5) Basic networking and certs
           docker run --rm "$IMAGE" curl -fsSL https://example.com >/dev/null
           echo "Runtime checks passed"
-      # Multi-arch build and push to Docker Hub only for semver tags
       - name: Build and push multi-arch Docker images (Docker Hub, semver-only)
         if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/build-push-action@v5
@@ -213,7 +328,6 @@ jobs:
           tags: |
             ${{ env.DOCKERHUB_IMAGE }}:latest
             ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
-            ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name || 'v0.0.0' }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -223,87 +337,4 @@ jobs:
         run: |
           set -euo pipefail
           VER="${GITHUB_REF_NAME#v}"
-          MAJOR=$(echo "$VER" | cut -d. -f1)
-          MINOR=$(echo "$VER" | cut -d. -f2)
-          echo "major=v$MAJOR" >> $GITHUB_OUTPUT
-          echo "minor=v$MAJOR.$MINOR" >> $GITHUB_OUTPUT
-      - name: Add major/minor tags on Docker Hub
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
-        run: |
-          docker buildx imagetools create \
-            -t ${{ env.DOCKERHUB_IMAGE }}:${{ steps.semver.outputs.minor }} \
-            -t ${{ env.DOCKERHUB_IMAGE }}:${{ steps.semver.outputs.major }} \
-            ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
-      - name: Remove non-semver tags from Docker Hub
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKERHUB_PASSWORD: ${{ secrets.DOCKER_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "Cleaning up non-semver tags on Docker Hub"
-          echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-          # Delete 'main', 'main-*', and commit SHA tags if they exist
-          for TAG in main $(docker manifest inspect ${{ env.DOCKERHUB_IMAGE }}:latest -v 2>/dev/null | jq -r '.[].Digest' | head -n1 | xargs -I{} echo "${GITHUB_SHA}"); do
-            docker manifest rm ${{ env.DOCKERHUB_IMAGE }}:$TAG || true
-          done
-      - name: Install cosign
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
-        uses: sigstore/cosign-installer@v3.5.0
-      - name: Sign Docker Hub images with cosign (keyless or key-based)
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
-        env:
-          COSIGN_EXPERIMENTAL: 'true'
-          COSIGN_YES: 'true'
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          for TAG in latest ${{ github.ref_name }} ${{ steps.semver.outputs.minor }} ${{ steps.semver.outputs.major }}; do
-            if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
-              echo "$COSIGN_PRIVATE_KEY" | base64 -d > cosign.key
-              cosign sign --key cosign.key "docker.io/${{ env.DOCKERHUB_IMAGE }}:$TAG"
-              rm -f cosign.key
-            else
-              cosign sign "docker.io/${{ env.DOCKERHUB_IMAGE }}:$TAG"
-            fi
-          done
-      - name: Generate SBOM (Docker Hub image)
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
-        uses: anchore/sbom-action@v0
-        with:
-          image: docker.io/${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-      - name: Upload SBOM
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom
-          path: sbom.spdx.json
-  # Summary job
-  summary:
-    name: Pipeline Summary
-    runs-on: ubuntu-latest
-    needs: [lint, dockerfile-lint, build-and-scan]
-    if: always()
-    steps:
-      - name: Check job statuses
-        run: |
-          echo "## CI/CD Pipeline Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Lint & Format: ${{ needs.lint.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Dockerfile Lint: ${{ needs.dockerfile-lint.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Build and Scan: ${{ needs.build-and-scan.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            echo "🌙 **Nightly rebuild completed** - Image updated with latest security patches" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "🔍 **PR/branch validation completed** - No images pushed to Docker Hub" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "🏷️ **Semantic versioned release published to Docker Hub**" >> $GITHUB_STEP_SUMMARY
-            echo "- Docker Hub: ${{ env.DOCKERHUB_IMAGE }} (latest, ${{ github.ref_name }}, ${{ steps.semver.outputs.minor }}, ${{ steps.semver.outputs.major }})" >> $GITHUB_STEP_SUMMARY
-            echo "- Architectures: linux/amd64, linux/arm64, linux/arm/v7" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "🔍 **PR validation completed** - Ready for review" >> $GITHUB_STEP_SUMMARY
-          fi
+         
