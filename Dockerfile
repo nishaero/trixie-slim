@@ -1,4 +1,5 @@
 FROM debian:trixie-slim
+
 # ================================
 # SECURE & FLEXIBLE PROFILE
 # ================================
@@ -34,65 +35,63 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    tini \
     sudo \
-    procps \
-    && apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    tini && \
+    rm -rf /var/lib/apt/lists/*
 
 # ================================
-# CREATE NON-ROOT USER
+# CREATE NON-ROOT USER & GROUPS
 # ================================
-RUN groupadd -r appuser --gid=1001 && \
-    useradd -r -g appuser --uid=1001 --home-dir=/app --shell=/bin/bash appuser && \
-    mkdir -p /app /tmp/.appuser && \
-    chown -R appuser:appuser /app /tmp/.appuser && \
-    chmod 1777 /tmp
+RUN groupadd -r -g 1001 appuser && \
+    useradd -r -u 1001 -g appuser -m -d /home/appuser -s /bin/bash appuser && \
+    mkdir -p /home/appuser && \
+    chown -R appuser:appuser /home/appuser
 
 # ================================
-# CONFIGURE SECURE SUDO
+# INSTALL_PACKAGES UTILITY
 # ================================
-# Configure sudo: Only allow install_packages, no password, no shell access
-RUN echo '#!/bin/bash\n\
-set -e\n\
-set -u\n\
-set -o pipefail\n\
-\n\
-# Security: Must run via sudo as appuser\n\
-if [ "$EUID" -ne 0 ]; then\n\
-  echo "Error: install_packages must be run with sudo" >&2\n\
-  exit 1\n\
-fi\n\
-\n\
-# Update package lists\n\
-apt-get update\n\
-\n\
-# Install packages with security flags\n\
-apt-get install -y --no-install-recommends "$@"\n\
-\n\
-# Comprehensive cleanup\n\
-apt-get clean\n\
-rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*\n\
-rm -rf /var/cache/apt/archives/*' > /usr/local/bin/install_packages && \
-    chmod 755 /usr/local/bin/install_packages && \
-    echo 'appuser ALL=(root) NOPASSWD: /usr/local/bin/install_packages' > /etc/sudoers.d/install_packages && \
-    chmod 440 /etc/sudoers.d/install_packages && \
-    echo 'Defaults!install_packages !requiretty' >> /etc/sudoers.d/install_packages
+# Secure package installation utility inspired by Bitnami
+COPY --chmod=755 <<'EOF' /usr/local/bin/install_packages
+#!/bin/bash
+set -eo pipefail
 
-# Configure locale support (minimal - only C.UTF-8)
-RUN echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends locales && \
-    locale-gen en_US.UTF-8 && \
-    update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8 && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# Security: Only allow execution via sudo
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: install_packages must be run via sudo"
+    exit 1
+fi
+
+# Validate arguments
+if [ $# -eq 0 ]; then
+    echo "Usage: sudo install_packages <package1> [package2 ...]"
+    exit 1
+fi
+
+# Install packages securely
+apt-get update
+apt-get install -y --no-install-recommends "$@"
+rm -rf /var/lib/apt/lists/*
+EOF
+
+# ================================
+# SECURE SUDO CONFIGURATION
+# ================================
+# 1. Disable password requirement for install_packages only
+RUN echo 'appuser ALL=(root) NOPASSWD: /usr/local/bin/install_packages' > /etc/sudoers.d/install_packages && \
+    chmod 0440 /etc/sudoers.d/install_packages && \
+    visudo -c
 
 # ================================
 # SECURITY HARDENING
 # ================================
-# 1. Remove setuid/setgid binaries (except sudo which is needed)
-RUN find / -xdev -perm /6000 -type f ! -path /usr/bin/sudo -exec chmod a-s {} \; 2>/dev/null || true
+# 1. Remove setuid/setgid bits except essential ones
+RUN find / -xdev -type f \( -perm -4000 -o -perm -2000 \) \
+    ! -path "/usr/bin/sudo" \
+    ! -path "/usr/bin/su" \
+    ! -path "/usr/lib/dbus-1.0/dbus-daemon-launch-helper" \
+    ! -path "/bin/mount" \
+    ! -path "/bin/umount" \
+    -exec chmod -s {} \; 2>/dev/null || true
 
 # 2. Remove world-writable files and directories (except /tmp, /var/tmp)
 RUN find / -xdev -type d -perm /0002 -not -path "/tmp*" -not -path "/var/tmp*" -not -path "/proc*" -not -path "/sys*" -exec chmod o-w {} \; 2>/dev/null || true && \
@@ -130,6 +129,7 @@ CMD ["/bin/bash"]
 
 # Switch to non-root user by default
 USER appuser
+
 WORKDIR /app
 
 # ================================
@@ -143,3 +143,5 @@ WORKDIR /app
 #   RUN install_packages nodejs npm
 #   USER appuser
 # ================================
+
+# Test commit to trigger pipeline
