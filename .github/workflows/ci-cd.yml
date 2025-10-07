@@ -58,7 +58,7 @@ jobs:
           set -euo pipefail
           # Capture package install lines; normalize whitespace and sort
           awk '/apt-get\s+update/ || /apt-get\s+install/ || /install_packages/ || /apk\s+add/ {print}' Dockerfile \
-            | sed -E 's/\\s+/ /g;s/\\s*\\\\$//g' \
+            | sed -E 's/\\s+/ /g;s/\\s*\\$//g' \
             | tr 'A-Z' 'a-z' \
             | sed -E 's/--no-install-recommends//g;s/-y//g;s/--no-cache//g' \
             | tr ' ' '\n' \
@@ -72,7 +72,7 @@ jobs:
           set -euo pipefail
           git show "${{ steps.base.outputs.ref }}:Dockerfile" > /tmp/Dockerfile.base || cp Dockerfile /tmp/Dockerfile.base
           awk '/apt-get\s+update/ || /apt-get\s+install/ || /install_packages/ || /apk\s+add/ {print}' /tmp/Dockerfile.base \
-            | sed -E 's/\\s+/ /g;s/\\s*\\\\$//g' \
+            | sed -E 's/\\s+/ /g;s/\\s*\\$//g' \
             | tr 'A-Z' 'a-z' \
             | sed -E 's/--no-install-recommends//g;s/-y//g;s/--no-cache//g' \
             | tr ' ' '\n' \
@@ -171,7 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [changes-gate]
     if: >-
-      ${!! github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }
+      ${{ github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }}
     permissions:
       contents: read
       security-events: write
@@ -198,7 +198,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [changes-gate, lint, dockerfile-lint]
     if: >-
-      ${!! github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }
+      ${{ github.event_name != 'schedule' || needs.changes-gate.outputs.should-build == 'true' }}
     permissions:
       contents: read
       packages: write
@@ -337,4 +337,4 @@ jobs:
         run: |
           set -euo pipefail
           VER="${GITHUB_REF_NAME#v}"
-         
+          
