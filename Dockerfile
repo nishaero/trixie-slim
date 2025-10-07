@@ -152,3 +152,4 @@ WORKDIR /app
 # ================================
 
 # Test commit to trigger pipeline
+# Now with .hadolint.yaml to ignore DL3008
